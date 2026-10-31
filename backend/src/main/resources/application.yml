@@ -1,0 +1,29 @@
+server:
+  port: 8080
+spring:
+  application:
+    name: sentinel-backend
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${POSTGRES_DB:sentinel}
+    username: ${POSTGRES_USER:sentinel}
+    password: ${POSTGRES_PASSWORD:sentinel}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  jackson:
+    time-zone: UTC
+sentinel:
+  agent-token: ${AGENT_TOKEN:local-dev-token}
+  alert:
+    cpu-warning: 75
+    cpu-critical: 90
+    memory-warning: 80
+    memory-critical: 92
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
