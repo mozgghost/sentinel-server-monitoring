@@ -1,9 +1,11 @@
 
 package com.sentinel.service;
 
-import com.sentinel.api.dto.*;
-import com.sentinel.domain.*;
-import com.sentinel.repository.*;
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
@@ -11,8 +13,20 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
-import java.time.Instant;
-import java.util.*;
+import com.sentinel.api.dto.CreateServerRequest;
+import com.sentinel.api.dto.IncidentResponse;
+import com.sentinel.api.dto.MetricIngestRequest;
+import com.sentinel.api.dto.ServerResponse;
+import com.sentinel.api.dto.UpdateServerRequest;
+import com.sentinel.domain.AlertSeverity;
+import com.sentinel.domain.AlertStatus;
+import com.sentinel.domain.Incident;
+import com.sentinel.domain.Metric;
+import com.sentinel.domain.ServerNode;
+import com.sentinel.domain.ServerStatus;
+import com.sentinel.repository.IncidentRepository;
+import com.sentinel.repository.MetricRepository;
+import com.sentinel.repository.ServerRepository;
 
 @Service
 public class MonitoringService {
@@ -56,6 +70,21 @@ public class MonitoringService {
                                 r.name(),
                                 r.host(),
                                 r.environment())));
+    }
+
+    @Transactional
+    public ServerResponse updateServer(UUID id, UpdateServerRequest r) {
+        ServerNode server = servers.findById(id)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.NOT_FOUND,
+                        "Server not found"));
+
+        server.updateDetails(
+                r.name().trim(),
+                r.host().trim(),
+                r.environment().trim());
+
+        return ServerResponse.from(servers.save(server));
     }
 
     public void deleteServer(UUID id) {
