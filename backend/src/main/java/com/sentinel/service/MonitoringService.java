@@ -1,4 +1,3 @@
-
 package com.sentinel.service;
 
 import java.time.Instant;
@@ -7,7 +6,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,12 +16,14 @@ import com.sentinel.api.dto.IncidentResponse;
 import com.sentinel.api.dto.MetricIngestRequest;
 import com.sentinel.api.dto.ServerResponse;
 import com.sentinel.api.dto.UpdateServerRequest;
+import com.sentinel.domain.AlertRule;
 import com.sentinel.domain.AlertSeverity;
 import com.sentinel.domain.AlertStatus;
 import com.sentinel.domain.Incident;
 import com.sentinel.domain.Metric;
 import com.sentinel.domain.ServerNode;
 import com.sentinel.domain.ServerStatus;
+import com.sentinel.repository.AlertRuleRepository;
 import com.sentinel.repository.IncidentRepository;
 import com.sentinel.repository.MetricRepository;
 import com.sentinel.repository.ServerRepository;
@@ -31,31 +31,28 @@ import com.sentinel.repository.ServerRepository;
 @Service
 public class MonitoringService {
 
+    private static final List<AlertStatus> ACTIVE_STATUSES = List.of(
+            AlertStatus.OPEN,
+            AlertStatus.ACKNOWLEDGED
+    );
+
     private final ServerRepository servers;
     private final MetricRepository metrics;
     private final IncidentRepository incidents;
-
-    @Value("${sentinel.alert.cpu-warning:75}")
-    double cpuWarning;
-
-    @Value("${sentinel.alert.cpu-critical:90}")
-    double cpuCritical;
-
-    @Value("${sentinel.alert.memory-warning:80}")
-    double memWarning;
-
-    @Value("${sentinel.alert.memory-critical:92}")
-    double memCritical;
+    private final AlertRuleRepository alertRules;
 
     public MonitoringService(
-            ServerRepository s,
-            MetricRepository m,
-            IncidentRepository i) {
-        servers = s;
-        metrics = m;
-        incidents = i;
+            ServerRepository servers,
+            MetricRepository metrics,
+            IncidentRepository incidents,
+            AlertRuleRepository alertRules) {
+        this.servers = servers;
+        this.metrics = metrics;
+        this.incidents = incidents;
+        this.alertRules = alertRules;
     }
 
+    @Transactional(readOnly = true)
     public List<ServerResponse> listServers() {
         return servers.findAll()
                 .stream()
@@ -63,186 +60,220 @@ public class MonitoringService {
                 .toList();
     }
 
-    public ServerResponse createServer(CreateServerRequest r) {
+    @Transactional
+    public ServerResponse createServer(CreateServerRequest request) {
         return ServerResponse.from(
                 servers.save(
                         new ServerNode(
-                                r.name(),
-                                r.host(),
-                                r.environment())));
+                                request.name(),
+                                request.host(),
+                                request.environment()
+                        )
+                )
+        );
     }
 
     @Transactional
-    public ServerResponse updateServer(UUID id, UpdateServerRequest r) {
+    public ServerResponse updateServer(UUID id, UpdateServerRequest request) {
         ServerNode server = servers.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND,
-                        "Server not found"));
+                        "Server not found"
+                ));
 
         server.updateDetails(
-                r.name().trim(),
-                r.host().trim(),
-                r.environment().trim());
+                request.name().trim(),
+                request.host().trim(),
+                request.environment().trim()
+        );
 
         return ServerResponse.from(servers.save(server));
     }
 
+    @Transactional
     public void deleteServer(UUID id) {
         if (!servers.existsById(id)) {
             throw new ResponseStatusException(
                     HttpStatus.NOT_FOUND,
-                    "Server not found");
+                    "Server not found"
+            );
         }
 
         servers.deleteById(id);
     }
 
     @Transactional
-    public void ingest(MetricIngestRequest r) {
-
-        ServerNode s = servers.findById(r.serverId())
+    public void ingest(MetricIngestRequest request) {
+        ServerNode server = servers.findById(request.serverId())
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND,
-                        "Server not found"));
+                        "Server not found"
+                ));
 
-        Instant at = r.recordedAt();
+        Instant recordedAt = request.recordedAt();
+        double cpu = request.cpuPercent();
+        double memory = request.memoryPercent();
 
-        double cpu = r.cpuPercent();
-        double memory = r.memoryPercent();
+        // Persist the latest metrics before evaluating alert rules.
+        server.updateMetrics(
+                cpu,
+                memory,
+                recordedAt,
+                ServerStatus.HEALTHY
+        );
 
-        // Determine CPU severity independently.
-        AlertSeverity cpuSeverity = null;
+        metrics.save(new Metric(server, cpu, memory, recordedAt));
 
-        if (cpu >= cpuCritical) {
-            cpuSeverity = AlertSeverity.CRITICAL;
-        } else if (cpu >= cpuWarning) {
-            cpuSeverity = AlertSeverity.WARNING;
+        // Evaluate every rule, including disabled rules.
+        // Disabled rules must resolve their previously active incidents.
+        List<AlertRule> rules = alertRules.findAll();
+
+        for (AlertRule rule : rules) {
+            double value;
+
+            if ("CPU".equalsIgnoreCase(rule.getMetric())) {
+                value = cpu;
+            } else if ("MEMORY".equalsIgnoreCase(rule.getMetric())) {
+                value = memory;
+            } else {
+                // Unsupported metric types are not evaluated.
+                continue;
+            }
+
+            boolean conditionMet = rule.isEnabled()
+                    && evaluateCondition(
+                            value,
+                            rule.getOperator(),
+                            rule.getThreshold()
+                    );
+
+            if (conditionMet) {
+                boolean created = createIncidentIfAbsent(
+                        server,
+                        rule.getSeverity(),
+                        rule.getName(),
+                        buildRuleDescription(rule, value)
+                );
+
+                if (created) {
+                    rule.markTriggered(recordedAt);
+                    alertRules.save(rule);
+                }
+            } else {
+                resolveActiveIncidents(
+                        server.getId(),
+                        rule.getName()
+                );
+            }
         }
 
-        // Determine memory severity independently.
-        AlertSeverity memorySeverity = null;
+        // Determine server status from all currently active incidents.
+        List<Incident> activeIncidents =
+                incidents.findAllByServer_IdAndStatusIn(
+                        server.getId(),
+                        ACTIVE_STATUSES
+                );
 
-        if (memory >= memCritical) {
-            memorySeverity = AlertSeverity.CRITICAL;
-        } else if (memory >= memWarning) {
-            memorySeverity = AlertSeverity.WARNING;
-        }
+        ServerStatus status = determineServerStatus(activeIncidents);
 
-        // Determine overall server status.
-        ServerStatus status;
-
-        if (cpuSeverity == AlertSeverity.CRITICAL ||
-                memorySeverity == AlertSeverity.CRITICAL) {
-            status = ServerStatus.CRITICAL;
-        } else if (cpuSeverity == AlertSeverity.WARNING ||
-                memorySeverity == AlertSeverity.WARNING) {
-            status = ServerStatus.WARNING;
-        } else {
-            status = ServerStatus.HEALTHY;
-        }
-
-        // Save current server metrics.
-        s.updateMetrics(cpu, memory, at, status);
-        servers.save(s);
-
-        metrics.save(
-                new Metric(s, cpu, memory, at));
-
-        // Resolve CPU incidents independently.
-        if (cpu < cpuWarning) {
-            resolveActiveIncidents(
-                    s.getId(),
-                    List.of(
-                            "High CPU usage",
-                            "Elevated CPU usage"));
-        }
-
-        // Resolve memory incidents independently.
-        if (memory < memWarning) {
-            resolveActiveIncidents(
-                    s.getId(),
-                    List.of(
-                            "High memory usage",
-                            "Elevated memory usage"));
-        }
-
-        // Create CPU incident if necessary.
-        if (cpuSeverity != null) {
-
-            String title = cpuSeverity == AlertSeverity.CRITICAL
-                    ? "High CPU usage"
-                    : "Elevated CPU usage";
-
-            String description = "CPU usage reached " + cpu + "%.";
-
-            createIncidentIfAbsent(
-                    s,
-                    cpuSeverity,
-                    title,
-                    description);
-        }
-
-        // Create memory incident if necessary.
-        if (memorySeverity != null) {
-
-            String title = memorySeverity == AlertSeverity.CRITICAL
-                    ? "High memory usage"
-                    : "Elevated memory usage";
-
-            String description = "Memory usage reached " + memory + "%.";
-
-            createIncidentIfAbsent(
-                    s,
-                    memorySeverity,
-                    title,
-                    description);
-        }
+        server.updateMetrics(cpu, memory, recordedAt, status);
+        servers.save(server);
     }
 
-    private void createIncidentIfAbsent(
+    private boolean evaluateCondition(
+            double value,
+            String operator,
+            double threshold) {
+
+        return switch (operator) {
+            case ">" -> value > threshold;
+            case ">=" -> value >= threshold;
+            default -> false;
+        };
+    }
+
+    private String buildRuleDescription(AlertRule rule, double actualValue) {
+        String metricName = rule.getMetric().equalsIgnoreCase("CPU")
+                ? "CPU usage"
+                : "Memory usage";
+
+        return metricName
+                + " reached "
+                + actualValue
+                + "% (rule: "
+                + rule.getOperator()
+                + " "
+                + rule.getThreshold()
+                + "%).";
+    }
+
+    private boolean createIncidentIfAbsent(
             ServerNode server,
             AlertSeverity severity,
             String title,
             String description) {
 
-        boolean alreadyExists = incidents.existsByServer_IdAndTitleAndStatusIn(
-                server.getId(),
-                title,
-                List.of(
-                        AlertStatus.OPEN,
-                        AlertStatus.ACKNOWLEDGED));
+        boolean alreadyExists =
+                incidents.existsByServer_IdAndTitleAndStatusIn(
+                        server.getId(),
+                        title,
+                        ACTIVE_STATUSES
+                );
 
-        if (!alreadyExists) {
-            incidents.save(
-                    new Incident(
-                            server,
-                            severity,
-                            title,
-                            description));
+        if (alreadyExists) {
+            return false;
         }
+
+        incidents.save(
+                new Incident(
+                        server,
+                        severity,
+                        title,
+                        description
+                )
+        );
+
+        return true;
     }
 
-    private void resolveActiveIncidents(
-            UUID serverId,
-            List<String> titles) {
+    private void resolveActiveIncidents(UUID serverId, String title) {
+        List<Incident> activeIncidents =
+                incidents.findAllByServer_IdAndTitleAndStatusIn(
+                        serverId,
+                        title,
+                        ACTIVE_STATUSES
+                );
 
-        List<AlertStatus> activeStatuses = List.of(
-                AlertStatus.OPEN,
-                AlertStatus.ACKNOWLEDGED);
+        activeIncidents.forEach(Incident::resolve);
 
-        for (String title : titles) {
-
-            List<Incident> activeIncidents = incidents.findAllByServer_IdAndTitleAndStatusIn(
-                    serverId,
-                    title,
-                    activeStatuses);
-
-            activeIncidents.forEach(Incident::resolve);
-
+        if (!activeIncidents.isEmpty()) {
             incidents.saveAll(activeIncidents);
         }
     }
 
+    private ServerStatus determineServerStatus(List<Incident> activeIncidents) {
+        boolean hasCritical = activeIncidents.stream()
+                .anyMatch(incident ->
+                        incident.getSeverity() == AlertSeverity.CRITICAL
+                );
+
+        if (hasCritical) {
+            return ServerStatus.CRITICAL;
+        }
+
+        boolean hasWarning = activeIncidents.stream()
+                .anyMatch(incident ->
+                        incident.getSeverity() == AlertSeverity.WARNING
+                );
+
+        if (hasWarning) {
+            return ServerStatus.WARNING;
+        }
+
+        return ServerStatus.HEALTHY;
+    }
+
+    @Transactional(readOnly = true)
     public List<IncidentResponse> listIncidents() {
         return incidents.findAllByOrderByCreatedAtDesc()
                 .stream()
@@ -250,34 +281,36 @@ public class MonitoringService {
                 .toList();
     }
 
+    @Transactional
     public IncidentResponse acknowledge(UUID id) {
-
-        Incident i = incidents.findById(id)
+        Incident incident = incidents.findById(id)
                 .orElseThrow(() -> new ResponseStatusException(
                         HttpStatus.NOT_FOUND,
-                        "Incident not found"));
+                        "Incident not found"
+                ));
 
-        i.acknowledge();
+        incident.acknowledge();
 
-        return IncidentResponse.from(
-                incidents.save(i));
+        return IncidentResponse.from(incidents.save(incident));
     }
 
+    @Transactional(readOnly = true)
     public List<Map<String, Object>> history(UUID serverId) {
-
         if (!servers.existsById(serverId)) {
             throw new ResponseStatusException(
                     HttpStatus.NOT_FOUND,
-                    "Server not found");
+                    "Server not found"
+            );
         }
 
         return metrics.findTop100ByServer_IdOrderByRecordedAtDesc(serverId)
                 .stream()
                 .sorted(Comparator.comparing(Metric::getRecordedAt))
-                .map(m -> Map.<String, Object>of(
-                        "recordedAt", m.getRecordedAt(),
-                        "cpuPercent", m.getCpuPercent(),
-                        "memoryPercent", m.getMemoryPercent()))
+                .map(metric -> Map.<String, Object>of(
+                        "recordedAt", metric.getRecordedAt(),
+                        "cpuPercent", metric.getCpuPercent(),
+                        "memoryPercent", metric.getMemoryPercent()
+                ))
                 .toList();
     }
 }
