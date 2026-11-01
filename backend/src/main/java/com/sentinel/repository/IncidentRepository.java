@@ -18,4 +18,8 @@ public interface IncidentRepository extends JpaRepository<Incident, UUID> {
             UUID serverId,
             String title,
             Collection<AlertStatus> statuses);
+
+    List<Incident> findAllByServer_IdAndStatusIn(
+            UUID serverId,
+            Collection<AlertStatus> statuses);
 }
