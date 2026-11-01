@@ -1,0 +1,62 @@
+name: Sentinel E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      AGENT_TOKEN: ci-test-token
+      SENTINEL_AGENT_TOKEN: ci-test-token
+      SENTINEL_BASE_URL: http://localhost:8081
+      AGENT_JAR_PATH: ${{ github.workspace }}/monitoring-agent/target/sentinel-monitoring-agent-0.1.0-jar-with-dependencies.jar
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build monitoring agent
+        run: mvn -B -f pom.xml -pl monitoring-agent -am package -DskipTests
+
+      - name: Start PostgreSQL and backend
+        run: docker compose up -d --build db backend
+
+      - name: Wait for backend API
+        run: |
+          for attempt in {1..60}; do
+            if curl --fail --silent http://localhost:8081/api/servers > /dev/null; then
+              echo "Backend API is ready."
+              exit 0
+            fi
+            echo "Waiting for backend... ($attempt/60)"
+            sleep 5
+          done
+          echo "Backend did not become ready in time."
+          docker compose logs backend db
+          exit 1
+
+      - name: Run E2E tests
+        run: mvn -B -f e2e-tests/pom.xml test
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-e2e-test-reports
+          path: e2e-tests/target/surefire-reports/
+          if-no-files-found: warn
+          retention-days: 14
