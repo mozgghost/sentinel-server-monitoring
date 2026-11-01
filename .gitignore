@@ -15,3 +15,6 @@ dist/
 **/.terraform/
 *.tfstate*
 *.tfvars
+
+# TypeScript build info
+*.tsbuildinfo
